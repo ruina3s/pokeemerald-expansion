@@ -1,45 +1,86 @@
+# ============================================================================
+# Build ROM —— 本项目的唯一编译入口（不做本地编译，全部在 GitHub 上构建）
+# 触发：push 到 master / 推 v* tag / 网页手动 Run workflow
+# 产物：运行页最下方 Artifacts（含 .gba / .elf / .map，可选 .sym）
+# ============================================================================
 name: Build ROM
 
 on:
   push:
-    branches: [master]
-    paths-ignore:            # 只改文档不触发编译，省时间
+    branches: [master]        # 只在 master 上自动编译；分支开发用网页手动触发
+    tags: ['v*']              # 推 v* tag 也编译，编完自动发 Release（见 job: release）
+    paths-ignore:             # 只改文档就不编译，省一次 8-20 分钟
       - '**.md'
       - 'docs/**'
-  workflow_dispatch:         # 支持网页上手动点"Run workflow"
+      - 'PROJECT_DOCS_ZH/**'
+  workflow_dispatch:          # 网页手动触发：可选版本、构建模式、全量/测试/符号表
     inputs:
       version:
-        description: '要编译的版本 (emerald / firered / leafgreen)'
-        required: true
-        default: 'emerald'
-      release_build:
-        description: '是否用 Release 构建 (LTO + NDEBUG)'
+        description: '游戏版本'
+        type: choice
+        options: [emerald, firered, leafgreen]
+        default: emerald
+      build_mode:
+        description: 'dev=带调试菜单 / debug=带调试菜单+调试信息 / release=关闭调试菜单'
+        type: choice
+        options: [dev, debug, release]
+        default: dev
+      clean_build:
+        description: '先 make tidy 再全量重编（改了 include/config/*.h 必须勾）'
+        type: boolean
+        default: false
+      run_tests:
+        description: '编译后跑 make check 测试套件（仅 emerald，首次约 +20 分钟）'
+        type: boolean
+        default: false
+      make_syms:
+        description: '额外产出 .sym 符号表（mGBA 调试器显示函数名）'
         type: boolean
         default: false
 
-concurrency:                 # 同一分支只保留最新一次构建，旧的自动取消
-  group: build-${{ github.ref }}
+# 同一个 ref 连续触发时，取消上一次还在跑的构建，只保留最新一次
+concurrency:
+  group: build-rom-${{ github.ref }}
   cancel-in-progress: true
 
 env:
-  COMPARE: 0                 # 必须为 0：CI 没有 baserom.gba
-  UNUSED_ERROR: 0            # 0 = 未使用变量只警告不报错（CI 更宽容）
-  DEPRECATED_ERROR: 0
+  COMPARE: 0            # 必须 0：设 1 需要 baserom.gba（版权问题，CI 里也没有）
+  UNUSED_ERROR: 0       # 0 = 未使用变量只警告；1 = 当错误（-Werror）
+  DEPRECATED_ERROR: 0   # 0 = 弃用 API 只警告；同上
 
 jobs:
   build:
+    name: Build (${{ inputs.version || 'emerald' }} / ${{ inputs.build_mode || 'dev' }})
     runs-on: ubuntu-latest
+    timeout-minutes: 90     # 兜底：正常 8-22 分钟，超 90 分钟一定是卡住了
+    # inputs 只在 job 级 env 里能用，放工作流级 env 会拿不到值
+    env:
+      BUILD: ${{ inputs.version || 'emerald' }}       # Makefile 读 BUILD 决定编哪一版
+      BUILD_MODE: ${{ inputs.build_mode || 'dev' }}   # push 触发时默认 dev
+    outputs:
+      artifact: ${{ steps.meta.outputs.name }}   # 传给下面 release job
     steps:
+      # ---- 1. 取代码 ------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 1     # 只取最新提交，省 30-60 秒（check_history.sh 要求 .git 存在）
 
+      # ---- 2. 装交叉工具链 ------------------------------------------------
       - name: Install toolchain
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential binutils-arm-none-eabi gcc-arm-none-eabi \
-            libnewlib-arm-none-eabi libpng-dev python3
+            build-essential \
+            binutils-arm-none-eabi \
+            gcc-arm-none-eabi \
+            libnewlib-arm-none-eabi \
+            libpng-dev \
+            python3
 
+      # ---- 3. 缓存构建工具 ------------------------------------------------
+      # tools/ 下 14 个二进制每次重编要 1.5-2.5 分钟，缓存后接近 0
+      # key 带 tools 源码哈希：工具代码一改 key 就变，自动重编，不会误用旧缓存
       - name: Cache build tools
         uses: actions/cache@v4
         with:
@@ -60,25 +101,101 @@ jobs:
             tools/wav2agb/wav2agb
           key: tools-${{ runner.os }}-${{ hashFiles('tools/*/Makefile', 'tools/**/*.c', 'tools/**/*.cpp', 'tools/**/*.h') }}
 
+      # 跑测试要额外两个工具（mGBA 无头 + patchelf），单独缓存，普通构建不背这个包袱
+      - name: Cache test tools
+        if: inputs.run_tests
+        uses: actions/cache@v4
+        with:
+          path: |
+            tools/patchelf/patchelf
+            tools/mgba-rom-test-hydra/mgba-rom-test-hydra
+          key: tools-check-${{ runner.os }}-${{ hashFiles('tools/**/Makefile', 'tools/**/*.c', 'tools/**/*.cpp', 'tools/**/*.h') }}
+
+      # ---- 4. 可选全量重编 ------------------------------------------------
+      # 改了 include/config/*.h、合并了上游大版本、或增量构建结果诡异时必须清
+      - name: Clean
+        if: inputs.clean_build
+        run: make tidy
+
+      # ---- 5. 编译 --------------------------------------------------------
+      # dev     → 不加参数：-O2，RELEASE 未定义 → 调试菜单全部可用
+      # debug   → DEBUG=1 ：-Og -g，同样带调试菜单，崩溃时有函数名+行号
+      # release → RELEASE=1：LTO + NDEBUG，调试菜单被 DISABLED_ON_RELEASE 关掉
       - name: Build ROM
         run: |
-          if [ "${{ inputs.release_build }}" = "true" ]; then
-            make -j"$(nproc)" -O release
-          elif [ "${{ inputs.version }}" = "firered" ]; then
-            make firered -j"$(nproc)" -O
-          elif [ "${{ inputs.version }}" = "leafgreen" ]; then
-            make leafgreen -j"$(nproc)" -O
-          else
-            make -j"$(nproc)" -O all
-          fi
+          set -eo pipefail
+          FLAGS=()
+          case "$BUILD_MODE" in
+            debug)   FLAGS+=("DEBUG=1") ;;
+            release) FLAGS+=("RELEASE=1") ;;
+          esac
+          echo "::notice::BUILD=$BUILD MODE=$BUILD_MODE"
+          make -j"$(nproc)" -O all "${FLAGS[@]}"
 
+      # ---- 6. 可选：测试套件 ----------------------------------------------
+      - name: Run tests
+        if: inputs.run_tests && (inputs.version || 'emerald') == 'emerald'
+        run: make -j"$(nproc)" -O check
+
+      # ---- 7. 可选：符号表 ------------------------------------------------
+      - name: Symbols
+        if: inputs.make_syms
+        run: make syms
+
+      # ---- 8. artifact 名 -------------------------------------------------
+      # ref 名里可能有 /（分支）或 v1.0.0（tag），拼进 artifact 名
+      - name: Compute artifact name
+        id: meta
+        run: |
+          REF="$(echo '${{ github.ref_name }}' | tr '/' '-')"
+          echo "name=rom-$BUILD-$BUILD_MODE-$REF" >> "$GITHUB_OUTPUT"
+
+      # ---- 9. 上传产物 ----------------------------------------------------
       - name: Upload ROM
         uses: actions/upload-artifact@v4
         with:
-          name: rom-${{ inputs.version || 'emerald' }}
+          name: ${{ steps.meta.outputs.name }}
           path: |
             poke*.gba
-            poke*.map
             poke*.elf
+            poke*.map
+            poke*.sym
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 30      # 30 天后自动删除；要长期保存就发 Release
+
+      # ---- 10. 构建摘要 ---------------------------------------------------
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### 构建结果"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 版本 | \`$BUILD\` |"
+            echo "| 模式 | \`$BUILD_MODE\` |"
+            echo "| 提交 | \`${{ github.sha }}\` |"
+            echo "| artifact | \`${{ steps.meta.outputs.name }}\` |"
+            echo ""
+            ls -lh poke*.gba 2>/dev/null || echo "未生成 .gba"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # 只有推 v* tag 时才跑：把 artifact 附到 Release，永久可下载
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # 不加这行无法创建 Release
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            poke*.gba
+            poke*.map
+          generate_release_notes: true
