@@ -1,0 +1,84 @@
+name: Build ROM
+
+on:
+  push:
+    branches: [master]
+    paths-ignore:            # 只改文档不触发编译，省时间
+      - '**.md'
+      - 'docs/**'
+  workflow_dispatch:         # 支持网页上手动点"Run workflow"
+    inputs:
+      version:
+        description: '要编译的版本 (emerald / firered / leafgreen)'
+        required: true
+        default: 'emerald'
+      release_build:
+        description: '是否用 Release 构建 (LTO + NDEBUG)'
+        type: boolean
+        default: false
+
+concurrency:                 # 同一分支只保留最新一次构建，旧的自动取消
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  COMPARE: 0                 # 必须为 0：CI 没有 baserom.gba
+  UNUSED_ERROR: 0            # 0 = 未使用变量只警告不报错（CI 更宽容）
+  DEPRECATED_ERROR: 0
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential binutils-arm-none-eabi gcc-arm-none-eabi \
+            libnewlib-arm-none-eabi libpng-dev python3
+
+      - name: Cache build tools
+        uses: actions/cache@v4
+        with:
+          path: |
+            tools/bin2c/bin2c
+            tools/gbafix/gbafix
+            tools/gbagfx/gbagfx
+            tools/jsonproc/jsonproc
+            tools/mapjson/mapjson
+            tools/mid2agb/mid2agb
+            tools/preproc/preproc
+            tools/ramscrgen/ramscrgen
+            tools/rsfont/rsfont
+            tools/scaninc/scaninc
+            tools/trainerproc/trainerproc
+            tools/compresSmol/compresSmol
+            tools/compresSmol/compresSmolTilemap
+            tools/wav2agb/wav2agb
+          key: tools-${{ runner.os }}-${{ hashFiles('tools/*/Makefile', 'tools/**/*.c', 'tools/**/*.cpp', 'tools/**/*.h') }}
+
+      - name: Build ROM
+        run: |
+          if [ "${{ inputs.release_build }}" = "true" ]; then
+            make -j"$(nproc)" -O release
+          elif [ "${{ inputs.version }}" = "firered" ]; then
+            make firered -j"$(nproc)" -O
+          elif [ "${{ inputs.version }}" = "leafgreen" ]; then
+            make leafgreen -j"$(nproc)" -O
+          else
+            make -j"$(nproc)" -O all
+          fi
+
+      - name: Upload ROM
+        uses: actions/upload-artifact@v4
+        with:
+          name: rom-${{ inputs.version || 'emerald' }}
+          path: |
+            poke*.gba
+            poke*.map
+            poke*.elf
+          if-no-files-found: error
+          retention-days: 30
